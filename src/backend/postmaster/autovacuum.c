@@ -369,6 +369,13 @@ StartAutoVacLauncher(void)
 {
 	pid_t		AutoVacPID;
 
+#ifndef WIN32
+	/*
+	 * Set the monitoring pipe for PostmasterIsAlive check
+	 */
+	postmaster_alive_fd = postmaster_alive_fds_watch[AutoVacLauncherProcess];
+#endif
+
 #ifdef EXEC_BACKEND
 	switch ((AutoVacPID = avlauncher_forkexec()))
 #else
@@ -386,7 +393,7 @@ StartAutoVacLauncher(void)
 			InitPostmasterChild();
 
 			/* Close the postmaster's sockets */
-			ClosePostmasterPorts(false);
+			ClosePostmasterPorts(false, true);
 
 			AutoVacLauncherMain(0, NULL);
 			break;
@@ -1447,7 +1454,7 @@ StartAutoVacWorker(void)
 			InitPostmasterChild();
 
 			/* Close the postmaster's sockets */
-			ClosePostmasterPorts(false);
+			ClosePostmasterPorts(false, false);
 
 			AutoVacWorkerMain(0, NULL);
 			break;

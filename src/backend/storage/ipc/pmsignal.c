@@ -275,7 +275,7 @@ PostmasterIsAlive(void)
 	char		c;
 	ssize_t		rc;
 
-	rc = read(postmaster_alive_fds[POSTMASTER_FD_WATCH], &c, 1);
+	rc = read(postmaster_alive_fd, &c, 1);
 	if (rc < 0)
 	{
 		if (errno == EAGAIN || errno == EWOULDBLOCK)

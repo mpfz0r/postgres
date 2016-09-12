@@ -590,7 +590,7 @@ SysLogger_Start(void)
 			InitPostmasterChild();
 
 			/* Close the postmaster's sockets */
-			ClosePostmasterPorts(true);
+			ClosePostmasterPorts(true, false);
 
 			/* Drop our connection to postmaster's shared memory, as well */
 			dsm_detach_all();

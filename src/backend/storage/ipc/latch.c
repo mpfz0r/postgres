@@ -652,7 +652,7 @@ AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd, Latch *latch,
 	else if (events == WL_POSTMASTER_DEATH)
 	{
 #ifndef WIN32
-		event->fd = postmaster_alive_fds[POSTMASTER_FD_WATCH];
+		event->fd = postmaster_alive_fd;
 #endif
 	}
 

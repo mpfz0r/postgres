@@ -13,6 +13,8 @@
 #ifndef _POSTMASTER_H
 #define _POSTMASTER_H
 
+#include "miscadmin.h"
+
 /* GUC options */
 extern bool EnableSSL;
 extern int	ReservedBackends;
@@ -33,7 +35,8 @@ extern bool restart_after_crash;
 #ifdef WIN32
 extern HANDLE PostmasterHandle;
 #else
-extern int	postmaster_alive_fds[2];
+extern int	postmaster_alive_fds_watch[NUM_AUXPROCTYPES];
+extern int	postmaster_alive_fd;
 
 /*
  * Constants that represent which of postmaster_alive_fds is held by
@@ -47,7 +50,7 @@ extern int	postmaster_alive_fds[2];
 extern const char *progname;
 
 extern void PostmasterMain(int argc, char *argv[]) pg_attribute_noreturn();
-extern void ClosePostmasterPorts(bool am_syslogger);
+extern void ClosePostmasterPorts(bool am_syslogger, bool monitor_pm);
 
 extern int	MaxLivePostmasterChildren(void);
 

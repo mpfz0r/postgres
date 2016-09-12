@@ -176,6 +176,7 @@ typedef struct bkend
 	bool		dead_end;		/* is it going to send an error and quit? */
 	bool		bgworker_notify;	/* gets bgworker start/stop notifications */
 	dlist_node	elem;			/* list link in BackendList */
+	int		postmaster_alive_fd_own;
 } Backend;
 
 static dlist_head BackendList = DLIST_STATIC_INIT(BackendList);
@@ -416,6 +417,7 @@ static void maybe_start_bgworker(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
+static void CreatePostmasterDeathWatchPipe(int *ownfd, int *watchfd);
 static void InitPostmasterDeathWatchHandle(void);
 
 /*
@@ -507,7 +509,7 @@ typedef struct
 	HANDLE		initial_signal_pipe;
 	HANDLE		syslogPipe[2];
 #else
-	int			postmaster_alive_fds[2];
+	int			postmaster_alive_fd;
 	int			syslogPipe[2];
 #endif
 	char		my_exec_path[MAXPGPATH];
@@ -542,10 +544,13 @@ static void ShmemBackendArrayRemove(Backend *bn);
 
 #ifndef WIN32
 /*
- * File descriptors for pipe used to monitor if postmaster is alive.
- * First is POSTMASTER_FD_WATCH, second is POSTMASTER_FD_OWN.
+ * File descriptors for pipes used to monitor if postmaster is alive.
+ * Every process gets it's own pipe.
+ * Contains the postmaster end of each pipe.
  */
-int			postmaster_alive_fds[2] = {-1, -1};
+int			postmaster_alive_fds_own[NUM_AUXPROCTYPES];
+int			postmaster_alive_fds_watch[NUM_AUXPROCTYPES];
+int			postmaster_alive_fd = -1; /* set per child */
 #else
 /* Process handle of postmaster used for the same purpose on Windows */
 HANDLE		PostmasterHandle;
@@ -2384,11 +2389,13 @@ ConnFree(Port *conn)
  * that are not needed by that child process.  The postmaster still has
  * them open, of course.
  *
+ * monitor_pm is set for childs that run the PostmasterIsAlive check
+ *
  * Note: we pass am_syslogger as a boolean because we don't want to set
  * the global variable yet when this is called.
  */
 void
-ClosePostmasterPorts(bool am_syslogger)
+ClosePostmasterPorts(bool am_syslogger, bool monitor_pm)
 {
 	int			i;
 
@@ -2398,12 +2405,32 @@ ClosePostmasterPorts(bool am_syslogger)
 	 * Close the write end of postmaster death watch pipe. It's important to
 	 * do this as early as possible, so that if postmaster dies, others won't
 	 * think that it's still running because we're holding the pipe open.
+	 *
+	 * For child processes that don't monitor the postmaster, all the
+	 * monitoring pipes are closed.
 	 */
-	if (close(postmaster_alive_fds[POSTMASTER_FD_OWN]))
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg_internal("could not close postmaster death monitoring pipe in child process: %m")));
-	postmaster_alive_fds[POSTMASTER_FD_OWN] = -1;
+	for (i = 0; i < NUM_AUXPROCTYPES; i++) {
+		if (monitor_pm)
+		{
+			if (postmaster_alive_fds_watch[i] != postmaster_alive_fd)
+			{
+				close(postmaster_alive_fds_watch[i]);
+				postmaster_alive_fds_watch[i] = -1;
+			}
+			if (close(postmaster_alive_fds_own[i]))
+				ereport(FATAL,
+						(errcode_for_file_access(),
+						 errmsg_internal("could not close postmaster death monitoring pipe in child process: %m")));
+			postmaster_alive_fds_own[i] = -1;
+		}
+		else
+		{
+			close(postmaster_alive_fds_own[i]);
+			postmaster_alive_fds_own[i] = -1;
+			close(postmaster_alive_fds_watch[i]);
+			postmaster_alive_fds_watch[i] = -1;
+		}
+	}
 #endif
 
 	/* Close the listen sockets */
@@ -3175,6 +3202,7 @@ CleanupBackend(int pid,
 				BackgroundWorkerStopNotifications(bp->pid);
 			}
 			dlist_delete(iter.cur);
+			close(bp->postmaster_alive_fd_own);
 			free(bp);
 			break;
 		}
@@ -3278,6 +3306,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 #endif
 			}
 			dlist_delete(iter.cur);
+			close(bp->postmaster_alive_fd_own);
 			free(bp);
 			/* Keep looping so we can signal remaining backends */
 		}
@@ -3913,19 +3942,36 @@ BackendStartup(Port *port)
 	/* Hasn't asked to be notified about any bgworkers yet */
 	bn->bgworker_notify = false;
 
+#ifndef WIN32
+	CreatePostmasterDeathWatchPipe(
+					&bn->postmaster_alive_fd_own,
+					&postmaster_alive_fd);
+#else
+	bn->postmaster_alive_fd_own = -1;
+#endif
+
 #ifdef EXEC_BACKEND
 	pid = backend_forkexec(port);
 #else							/* !EXEC_BACKEND */
 	pid = fork_process();
 	if (pid == 0)				/* child */
 	{
-		free(bn);
+		dlist_iter	iter;
 
 		/* Detangle from postmaster */
 		InitPostmasterChild();
 
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
+		close(bn->postmaster_alive_fd_own);
+
+		dlist_foreach(iter, &BackendList)
+		{
+			Backend    *bp = dlist_container(Backend, elem, iter.cur);
+			close(bp->postmaster_alive_fd_own);
+		}
+
+		free(bn);
 
 		/* Perform additional initialization and collect startup packet */
 		BackendInitialize(port);
@@ -3942,6 +3988,8 @@ BackendStartup(Port *port)
 
 		if (!bn->dead_end)
 			(void) ReleasePostmasterChildSlot(bn->child_slot);
+		close(postmaster_alive_fd);
+		close(bn->postmaster_alive_fd_own);
 		free(bn);
 		errno = save_errno;
 		ereport(LOG,
@@ -3959,6 +4007,8 @@ BackendStartup(Port *port)
 	 * Everything's been successful, it's safe to add this backend to our list
 	 * of backends.
 	 */
+	close(postmaster_alive_fd);
+	postmaster_alive_fd = -1;
 	bn->pid = pid;
 	bn->bkend_type = BACKEND_TYPE_NORMAL;		/* Can change later to WALSND */
 	dlist_push_head(&BackendList, &bn->elem);
@@ -4701,7 +4751,7 @@ SubPostmasterMain(int argc, char *argv[])
 		Assert(argc == 3);		/* shouldn't be any more args */
 
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/*
 		 * Need to reinitialize the SSL library in the backend, since the
@@ -4752,7 +4802,7 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkboot") == 0)
 	{
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
@@ -4768,7 +4818,7 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkavlauncher") == 0)
 	{
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
@@ -4784,7 +4834,7 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkavworker") == 0)
 	{
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
@@ -4805,7 +4855,7 @@ SubPostmasterMain(int argc, char *argv[])
 		IsBackgroundWorker = true;
 
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/* Restore basic shared memory pointers */
 		InitShmemAccess(UsedShmemSegAddr);
@@ -4825,7 +4875,7 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkarch") == 0)
 	{
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/* Do not want to attach to shared memory */
 
@@ -4834,7 +4884,7 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkcol") == 0)
 	{
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, false);
 
 		/* Do not want to attach to shared memory */
 
@@ -4843,7 +4893,7 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forklog") == 0)
 	{
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(true);
+		ClosePostmasterPorts(true, false);
 
 		/* Do not want to attach to shared memory */
 
@@ -5207,6 +5257,8 @@ StartChildProcess(AuxProcType type)
 	av[ac] = NULL;
 	Assert(ac < lengthof(av));
 
+	postmaster_alive_fd = postmaster_alive_fds_watch[type];
+
 #ifdef EXEC_BACKEND
 	pid = postmaster_forkexec(ac, av);
 #else							/* !EXEC_BACKEND */
@@ -5217,7 +5269,7 @@ StartChildProcess(AuxProcType type)
 		InitPostmasterChild();
 
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		ClosePostmasterPorts(false, true);
 
 		/* Release postmaster's working memory context */
 		MemoryContextSwitchTo(TopMemoryContext);
@@ -5275,6 +5327,7 @@ StartChildProcess(AuxProcType type)
 	/*
 	 * in parent, successful fork
 	 */
+	postmaster_alive_fd = -1;
 	return pid;
 }
 
@@ -5523,7 +5576,7 @@ do_start_bgworker(RegisteredBgWorker *rw)
 			InitPostmasterChild();
 
 			/* Close the postmaster's sockets */
-			ClosePostmasterPorts(false);
+			ClosePostmasterPorts(false, false);
 
 			/*
 			 * Before blowing away PostmasterContext, save this bgworker's
@@ -5841,8 +5894,7 @@ save_backend_variables(BackendParameters *param, Port *port,
 								 childProcess))
 		return false;
 #else
-	memcpy(&param->postmaster_alive_fds, &postmaster_alive_fds,
-		   sizeof(postmaster_alive_fds));
+	param->postmaster_alive_fd = postmaster_alive_fd;
 #endif
 
 	memcpy(&param->syslogPipe, &syslogPipe, sizeof(syslogPipe));
@@ -6070,8 +6122,8 @@ restore_backend_variables(BackendParameters *param, Port *port)
 	PostmasterHandle = param->PostmasterHandle;
 	pgwin32_initial_signal_pipe = param->initial_signal_pipe;
 #else
-	memcpy(&postmaster_alive_fds, &param->postmaster_alive_fds,
-		   sizeof(postmaster_alive_fds));
+	memcpy(&postmaster_alive_fds_watch, &param->postmaster_alive_fds_watch,
+		   sizeof(postmaster_alive_fds_watch));
 #endif
 
 	memcpy(&syslogPipe, &param->syslogPipe, sizeof(syslogPipe));
@@ -6197,8 +6249,29 @@ pgwin32_deadchild_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
 }
 #endif   /* WIN32 */
 
+static void
+CreatePostmasterDeathWatchPipe(int *ownfd, int *watchfd)
+{
+	int tmp_pipe[2];
+
+	if (pipe(tmp_pipe))
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg_internal("could not create pipe to monitor postmaster death: %m")));
+	/*
+	 * Set O_NONBLOCK to allow testing for the fd's presence with a read()
+	 * call.
+	 */
+	if (fcntl(tmp_pipe[POSTMASTER_FD_WATCH], F_SETFL, O_NONBLOCK))
+		ereport(FATAL,
+				(errcode_for_socket_access(),
+				 errmsg_internal("could not set postmaster death monitoring pipe to nonblocking mode: %m")));
+	*ownfd = tmp_pipe[POSTMASTER_FD_OWN];
+	*watchfd = tmp_pipe[POSTMASTER_FD_WATCH];
+}
+
 /*
- * Initialize one and only handle for monitoring postmaster death.
+ * Initialize one per process handle for monitoring postmaster death.
  *
  * Called once in the postmaster, so that child processes can subsequently
  * monitor if their parent is dead.
@@ -6208,9 +6281,12 @@ InitPostmasterDeathWatchHandle(void)
 {
 #ifndef WIN32
 
+	int i;
+
 	/*
-	 * Create a pipe. Postmaster holds the write end of the pipe open
-	 * (POSTMASTER_FD_OWN), and children hold the read end. Children can pass
+	 * Create a pipe for each Auxiliary Proc.
+	 * Postmaster holds the write end of the pipe open
+	 * (postmaster_alive_fds_own[]), and children hold the read end. Children can pass
 	 * the read file descriptor to select() to wake up in case postmaster
 	 * dies, or check for postmaster death with a (read() == 0). Children must
 	 * close the write end as soon as possible after forking, because EOF
@@ -6218,19 +6294,12 @@ InitPostmasterDeathWatchHandle(void)
 	 * write fd. That is taken care of in ClosePostmasterPorts().
 	 */
 	Assert(MyProcPid == PostmasterPid);
-	if (pipe(postmaster_alive_fds))
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg_internal("could not create pipe to monitor postmaster death: %m")));
+	for (i = 0; i < NUM_AUXPROCTYPES; i++) {
+		CreatePostmasterDeathWatchPipe(
+						&postmaster_alive_fds_own[i],
+						&postmaster_alive_fds_watch[i]);
+	}
 
-	/*
-	 * Set O_NONBLOCK to allow testing for the fd's presence with a read()
-	 * call.
-	 */
-	if (fcntl(postmaster_alive_fds[POSTMASTER_FD_WATCH], F_SETFL, O_NONBLOCK))
-		ereport(FATAL,
-				(errcode_for_socket_access(),
-				 errmsg_internal("could not set postmaster death monitoring pipe to nonblocking mode: %m")));
 #else
 
 	/*

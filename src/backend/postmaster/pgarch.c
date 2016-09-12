@@ -138,6 +138,13 @@ pgarch_start(void)
 		return 0;
 	last_pgarch_start_time = curtime;
 
+#ifndef WIN32
+	/*
+	 * Set the monitoring pipe for PostmasterIsAlive check
+	 */
+	postmaster_alive_fd = postmaster_alive_fds_watch[PgArchiverProcess];
+#endif
+
 #ifdef EXEC_BACKEND
 	switch ((pgArchPid = pgarch_forkexec()))
 #else
@@ -155,7 +162,7 @@ pgarch_start(void)
 			InitPostmasterChild();
 
 			/* Close the postmaster's sockets */
-			ClosePostmasterPorts(false);
+			ClosePostmasterPorts(false, true);
 
 			/* Drop our connection to postmaster's shared memory, as well */
 			dsm_detach_all();

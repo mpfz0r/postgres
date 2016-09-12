@@ -392,6 +392,14 @@ typedef enum
 	CheckpointerProcess,
 	WalWriterProcess,
 	WalReceiverProcess,
+	/*
+	 * The types below are not auxiliary processes.
+	 * We abuse the identifiers as a reference for
+	 * the per-process postmaster monitoring pipe
+	 */
+	PgArchiverProcess,
+	AutoVacLauncherProcess,
+	PgStatProcess,
 
 	NUM_AUXPROCTYPES			/* Must be last! */
 } AuxProcType;
